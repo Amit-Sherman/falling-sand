@@ -96,6 +96,18 @@
       cursor: pointer;
     }
     .controls button:hover { border-color: var(--muted); }
+    .controls select {
+      padding: 5px 8px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      font: inherit;
+    }
+    .speed { display: flex; align-items: center; gap: 6px; }
+    .speed button { padding: 6px 10px; min-width: 34px; }
+    #speedVal { min-width: 76px; text-align: center; font-variant-numeric: tabular-nums; }
+    .clock { color: var(--muted); font-variant-numeric: tabular-nums; }
     .stats { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
     .help { margin-top: 12px; color: var(--muted); font-size: 0.85rem; line-height: 1.5; }
   </style>
@@ -114,9 +126,31 @@
         <input type="range" id="brush" min="1" max="20" value="4">
         <span id="brushVal">4</span>
       </label>
+      <span class="speed">
+        <button id="slower" title="Slower (-)">−</button>
+        <span id="speedVal">Speed 1×</span>
+        <button id="faster" title="Faster (+)">+</button>
+      </span>
       <button id="pause">Pause</button>
       <button id="clear">Clear</button>
+      <button id="sound" title="Sound (M)">🔊 Sound on</button>
       <span class="stats" id="stats"></span>
+    </div>
+
+    <div class="controls">
+      <label>Background
+        <select id="bg">
+          <option value="hills">Hills</option>
+          <option value="sky">Sky</option>
+          <option value="desert">Desert</option>
+          <option value="ocean">Ocean</option>
+          <option value="city">City</option>
+          <option value="space">Space</option>
+          <option value="plain">Plain dark</option>
+        </select>
+      </label>
+      <button id="cycle" title="Day/night cycle (N)">Day/night: on</button>
+      <span id="clock" class="clock"></span>
     </div>
 
     <p class="help">
@@ -125,7 +159,9 @@
       plants grow by drinking water · fire spreads through plants, trees and wood ·
       acid eats almost everything except walls ·
       sand sinks through water.<br>
-      <strong>Keys:</strong> 1–9, 0 pick a material · E eraser · Space pause · C clear · [ ] brush size
+      Trees grow faster in daylight.<br>
+      <strong>Keys:</strong> 1–9, 0 pick a material · E eraser · Space pause · C clear · [ ] brush size ·
+      − + speed · N day/night · M sound
     </p>
   </div>
 
@@ -151,6 +187,10 @@
     DENS[WALL] = DENS[PLANT] = DENS[WOOD] = DENS[TREE] = DENS[LEAF] = 255;
 
     const FLAMMABLE = new Set([PLANT, WOOD, TREE, LEAF]);
+
+    // Simulation events counted each frame so the sound engine can react to them
+    const ev = { steam: 0, fizz: 0, sprout: 0, tree: 0, crown: 0, fires: 0 };
+    let daylight = 1; // 0 at night, 1 in full day; set by the day/night cycle
 
     const isLiquid = t => t === WATER || t === ACID || t === LAVA;
     const inb = (x, y) => x >= 0 && x < W && y >= 0 && y < H;
@@ -244,6 +284,7 @@
         const n = ny * W + nx, nt = type[n];
         if (nt === WATER) {
           set(i, EMPTY);
+          ev.steam++;
           if (rand() < 0.3) set(n, STEAM);
           return;
         }
@@ -264,7 +305,7 @@
         const nx = x + dx, ny = y + dy;
         if (!inb(nx, ny)) continue;
         const n = ny * W + nx, nt = type[n];
-        if (nt === WATER) { set(i, STONE); set(n, STEAM); return; }
+        if (nt === WATER) { set(i, STONE); set(n, STEAM); ev.steam++; return; }
         if (FLAMMABLE.has(nt) && rand() < 0.1) set(n, FIRE);
       }
       if (y > 0 && type[i - W] === EMPTY && rand() < 0.003) set(i - W, FIRE);
@@ -287,6 +328,7 @@
         const n = ny * W + nx, nt = type[n];
         if ((nt === SAND || nt === DIRT || nt === STONE || FLAMMABLE.has(nt)) && rand() < 0.15) {
           set(n, rand() < 0.3 ? SMOKE : EMPTY);
+          ev.fizz++;
           if (rand() < 0.3) { set(i, EMPTY); return; } // acid gets used up
         }
       }
@@ -319,9 +361,11 @@
           if (room && (type[up] === EMPTY || type[up] === PLANT) && rand() < 0.25) {
             set(up, TREE);
             life[up] = 15 + (rand() * 20 | 0); // how tall the trunk will get
+            ev.tree++;
             life[i] = 0;
           } else if (type[up] === EMPTY) {
             set(up, PLANT);
+            ev.sprout++;
             life[i] = 0;
           }
         }
@@ -342,7 +386,7 @@
     // A tree tip climbs upward leaving wood behind, sprouts side branches,
     // and turns into a ball of leaves when it runs out of energy or room.
     function updateTree(x, y, i) {
-      if (rand() > 0.08) return;
+      if (rand() > 0.08 * (0.25 + 0.75 * daylight)) return; // slower at night
       const d = dir[i];
       const nx = x + (d !== 0 && rand() < 0.6 ? d : 0), ny = y - 1;
       const n = ny * W + nx;
@@ -350,6 +394,7 @@
       if (life[i] === 0 || blocked) {
         set(i, WOOD);
         growCrown(x, y - 1, d === 0 ? 4 + (rand() * 2 | 0) : 2 + (rand() * 2 | 0));
+        ev.crown++;
         return;
       }
       const energy = life[i] - 1;
@@ -400,7 +445,7 @@
               break;
             case ACID:  updateAcid(x, y, i); break;
             case LAVA:  updateLava(x, y, i); break;
-            case FIRE:  updateFire(x, y, i); break;
+            case FIRE:  ev.fires++; updateFire(x, y, i); break;
             case PLANT: updatePlant(x, y, i); break;
             case STEAM:
             case SMOKE: updateGas(x, y, i, t); break;
@@ -426,15 +471,25 @@
     const pack = (r, g, b) =>
       (255 << 24) | (Math.min(255, b) << 16) | (Math.min(255, g) << 8) | Math.min(255, r);
 
-    const palette = new Uint32Array(NUM_TYPES * 16);
-    for (const t in BASE) {
-      const [hex, v] = BASE[t];
-      const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
-      for (let s = 0; s < 16; s++) {
-        const f = 1 + (s / 15 - 0.5) * v;
-        palette[t * 16 + s] = pack(r * f | 0, g * f | 0, b * f | 0);
+    // One palette per light level so particles get darker at night.
+    // Glowing materials (lava, acid) keep full brightness.
+    const LIGHT_LEVELS = 8;
+    const GLOWS = new Set([LAVA, ACID]);
+    const palettes = [];
+    for (let level = 0; level < LIGHT_LEVELS; level++) {
+      const light = 0.4 + 0.6 * level / (LIGHT_LEVELS - 1);
+      const palette = new Uint32Array(NUM_TYPES * 16);
+      for (const t in BASE) {
+        const [hex, v] = BASE[t];
+        const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+        for (let s = 0; s < 16; s++) {
+          const f = (1 + (s / 15 - 0.5) * v) * (GLOWS.has(+t) ? 1 : light);
+          palette[t * 16 + s] = pack(r * f | 0, g * f | 0, b * f | 0);
+        }
       }
+      palettes.push(palette);
     }
+    let lightLevel = LIGHT_LEVELS - 1;
 
     // Fire goes from dark red (dying) to bright yellow (fresh)
     const fireColors = new Uint32Array(128);
@@ -451,10 +506,161 @@
     const image = ctx.createImageData(W, H);
     const pixels = new Uint32Array(image.data.buffer);
 
+    // ---------- Backgrounds & day/night ----------
+    const DAY_STEPS = 5400;   // one full day = 90 seconds at normal speed
+    const HORIZON = Math.round(H * 0.62);
+    let timeOfDay = 0.12;     // 0 sunrise, 0.25 noon, 0.5 sunset, 0.75 midnight
+    let cycleOn = true;
+    let bgKind = 'hills';
+
+    // Each color has three versions: [day, dusk, night]
+    const PH = {
+      skyTop:       [[70, 140, 220],  [60, 50, 110],  [5, 8, 22]],
+      skyBottom:    [[165, 210, 245], [250, 150, 95], [20, 28, 58]],
+      hillFar:      [[110, 160, 125], [95, 72, 100],  [20, 28, 42]],
+      hillNear:     [[68, 122, 82],   [62, 46, 70],   [11, 17, 26]],
+      duneFar:      [[226, 186, 128], [176, 108, 92], [40, 36, 54]],
+      duneNear:     [[206, 160, 98],  [146, 86, 74],  [28, 26, 40]],
+      seaTop:       [[50, 120, 180],  [110, 80, 120], [12, 22, 44]],
+      seaBottom:    [[22, 62, 112],   [42, 34, 72],   [5, 10, 22]],
+      building:     [[118, 128, 150], [72, 56, 82],   [18, 20, 30]],
+      buildingDark: [[95, 104, 125],  [58, 44, 68],   [13, 15, 23]],
+      window:       [[160, 180, 205], [210, 160, 100], [255, 205, 120]],
+    };
+
+    const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    // Deterministic pseudo-random so all three phases share the same stars, windows, etc.
+    const hash = (x, y) => { const s = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453; return s - Math.floor(s); };
+
+    // Builds the background as three RGB images (day, dusk, night) that get blended over time
+    function buildBackground(kind) {
+      const bufs = [0, 1, 2].map(() => new Uint8ClampedArray(N * 3));
+      const sky = new Uint8Array(N); // 1 where the sky shows (stars, sun and moon go there)
+      const far = new Float32Array(W), near = new Float32Array(W);
+      for (let x = 0; x < W; x++) {
+        if (kind === 'hills') {
+          far[x]  = H * 0.5  + Math.sin(x * 0.03) * 9 + Math.sin(x * 0.071 + 1) * 5;
+          near[x] = H * 0.68 + Math.sin(x * 0.045 + 2) * 8 + Math.sin(x * 0.13) * 3;
+        } else if (kind === 'desert') {
+          far[x]  = H * 0.58 + Math.sin(x * 0.022 + 0.5) * 7 + Math.sin(x * 0.05) * 3;
+          near[x] = H * 0.72 + Math.sin(x * 0.03 + 2.2) * 6 + Math.sin(x * 0.08) * 2;
+        }
+      }
+      // City skyline: buildings of random width and height
+      const roof = new Float32Array(W).fill(H), bStart = new Int16Array(W), bShade = new Uint8Array(W);
+      if (kind === 'city') {
+        let x = 0, n = 0;
+        while (x < W) {
+          const w = 6 + (hash(n, 1) * 11 | 0), top = H * (0.3 + hash(n, 2) * 0.35), gap = hash(n, 3) * 3 | 0;
+          for (let k = x; k < Math.min(W, x + w); k++) { roof[k] = top; bStart[k] = x; bShade[k] = n & 1; }
+          x += w + gap;
+          n++;
+        }
+      }
+
+      for (let p = 0; p < 3; p++) {
+        const buf = bufs[p];
+        for (let y = 0; y < H; y++) {
+          for (let x = 0; x < W; x++) {
+            const i = y * W + x;
+            let c, isSky = 1;
+            if (kind === 'plain') {
+              c = [13, 15, 20]; isSky = 0;
+            } else if (kind === 'space') {
+              const d1 = Math.hypot(x - W * 0.3, y - H * 0.35) / 55, d2 = Math.hypot(x - W * 0.75, y - H * 0.6) / 45;
+              const a = Math.exp(-d1 * d1), b = Math.exp(-d2 * d2);
+              c = [6 + 70 * a + 20 * b, 6 + 20 * a + 50 * b, 16 + 90 * a + 90 * b];
+            } else {
+              const sy = kind === 'sky' ? y / H : Math.min(1, y / HORIZON);
+              c = mix(PH.skyTop[p], PH.skyBottom[p], sy);
+              if (kind === 'hills' || kind === 'desert') {
+                const [fc, nc] = kind === 'hills' ? [PH.hillFar, PH.hillNear] : [PH.duneFar, PH.duneNear];
+                if (y > near[x]) { c = nc[p]; isSky = 0; }
+                else if (y > far[x]) { c = fc[p]; isSky = 0; }
+              } else if (kind === 'ocean' && y >= HORIZON) {
+                c = mix(PH.seaTop[p], PH.seaBottom[p], (y - HORIZON) / (H - HORIZON));
+                if (hash(x >> 2, y) < 0.08) c = mix(c, [255, 255, 255], 0.12); // wave glints
+                isSky = 0;
+              } else if (kind === 'city' && y >= roof[x]) {
+                c = (bShade[x] ? PH.buildingDark : PH.building)[p];
+                const lx = x - bStart[x], ly = Math.floor(y - roof[x]);
+                if (lx % 3 === 1 && ly % 4 === 2 && hash(bStart[x] + lx, ly) < 0.45) c = PH.window[p];
+                isSky = 0;
+              }
+            }
+            // Stars: always in space, only at night elsewhere
+            if (isSky && (kind === 'space' || p === 2) && hash(x, y + 999) < 0.006) {
+              c = mix(c, [255, 255, 255], 0.5 + hash(y, x) * 0.5);
+            }
+            buf[i * 3] = c[0]; buf[i * 3 + 1] = c[1]; buf[i * 3 + 2] = c[2];
+            sky[i] = isSky;
+          }
+        }
+      }
+      return { bufs, sky, celestial: kind !== 'plain' && kind !== 'space' };
+    }
+
+    let bg = buildBackground(bgKind);
+    const bgPixels = new Uint32Array(N);
+
+    // How much of each phase to show, from the sun's height (-1 midnight .. 1 noon)
+    function phaseWeights(s) {
+      if (s >= 0.3) return [1, 0, 0];
+      if (s >= 0) { const k = s / 0.3; return [k, 1 - k, 0]; }
+      if (s >= -0.3) { const k = -s / 0.3; return [0, 1 - k, k]; }
+      return [0, 0, 1];
+    }
+
+    // Draw a sun or moon traveling in an arc across the sky (u: 0 rising .. 1 setting)
+    function drawBody(u, radius, color, glow, crescent) {
+      const cx = -10 + (W + 20) * u;
+      const cy = HORIZON - Math.sin(Math.PI * u) * (HORIZON - 18);
+      const reach = radius + glow;
+      for (let dy = -reach; dy <= reach; dy++) {
+        for (let dx = -reach; dx <= reach; dx++) {
+          const x = Math.round(cx + dx), y = Math.round(cy + dy);
+          if (!inb(x, y) || !bg.sky[y * W + x]) continue;
+          const d = Math.hypot(dx, dy);
+          const i = y * W + x;
+          if (d <= radius) {
+            if (crescent && Math.hypot(dx - 2.5, dy + 1) < radius - 0.5) continue;
+            bgPixels[i] = pack(color[0], color[1], color[2]);
+          } else if (glow) {
+            const f = 1 - (d - radius) / glow;
+            if (f <= 0) continue;
+            const k = f * f * 0.4;
+            const p = bgPixels[i];
+            const r = p & 255, g = (p >> 8) & 255, b = (p >> 16) & 255;
+            bgPixels[i] = pack(r + (color[0] - r) * k | 0, g + (color[1] - g) * k | 0, b + (color[2] - b) * k | 0);
+          }
+        }
+      }
+    }
+
+    function updateSky() {
+      const s = Math.sin(2 * Math.PI * timeOfDay);
+      daylight = Math.max(0, Math.min(1, (s + 0.15) / 0.4));
+      lightLevel = bg.celestial ? Math.round(daylight * (LIGHT_LEVELS - 1)) : LIGHT_LEVELS - 1;
+      const [wd, wk, wn] = phaseWeights(s);
+      const [d, k, n] = bg.bufs;
+      for (let i = 0, j = 0; i < N; i++, j += 3) {
+        bgPixels[i] = pack(
+          d[j] * wd + k[j] * wk + n[j] * wn | 0,
+          d[j + 1] * wd + k[j + 1] * wk + n[j + 1] * wn | 0,
+          d[j + 2] * wd + k[j + 2] * wk + n[j + 2] * wn | 0);
+      }
+      if (bg.celestial) {
+        if (timeOfDay < 0.5) drawBody(timeOfDay / 0.5, 6, [255, 236, 150], 10, false);
+        else drawBody((timeOfDay - 0.5) / 0.5, 5, [235, 235, 215], 5, true);
+      }
+    }
+
     function render() {
+      const palette = palettes[lightLevel];
       for (let i = 0; i < N; i++) {
         const t = type[i];
-        if (t === FIRE) pixels[i] = fireColors[Math.min(life[i], 127)];
+        if (t === EMPTY) pixels[i] = bgPixels[i];
+        else if (t === FIRE) pixels[i] = fireColors[Math.min(life[i], 127)];
         else if (t === DIRT && life[i] > 0) pixels[i] = palette[WET_DIRT * 16 + shade[i]];
         else pixels[i] = palette[t * 16 + shade[i]];
       }
@@ -465,7 +671,11 @@
           for (let dx = -r - 1; dx <= r + 1; dx++) {
             const d = Math.sqrt(dx * dx + dy * dy);
             const x = pointer.x + dx, y = pointer.y + dy;
-            if (Math.abs(d - r) < 0.5 && inb(x, y)) pixels[y * W + x] = 0xffdddddd;
+            if (Math.abs(d - r) >= 0.5 || !inb(x, y)) continue;
+            // Light outline on dark pixels, dark outline on light ones
+            const p = pixels[y * W + x];
+            const bright = (p & 255) + ((p >> 8) & 255) + ((p >> 16) & 255) > 400;
+            pixels[y * W + x] = bright ? 0xff222222 : 0xffdddddd;
           }
         }
       }
@@ -584,14 +794,198 @@
     function clearAll() { type.fill(EMPTY); life.fill(0); }
     document.getElementById('clear').onclick = clearAll;
 
+    // ---------- Sound (synthesized with Web Audio, no sound files) ----------
+    const Sound = {
+      ctx: null, master: null, noise: null, enabled: true, last: {},
+
+      // Browsers only allow audio after a click or key press, so this runs on the first one
+      init() {
+        if (!this.enabled) return;
+        if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = 0.5;
+        this.master.connect(this.ctx.destination);
+        // One second of white noise, reused for every hiss and crackle
+        const len = this.ctx.sampleRate;
+        this.noise = this.ctx.createBuffer(1, len, len);
+        const data = this.noise.getChannelData(0);
+        for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+      },
+
+      running() { return this.enabled && this.ctx && this.ctx.state === 'running'; },
+
+      // Is sound running, and has enough time passed since this sound last played?
+      ok(name, gapMs) {
+        if (!this.running()) return false;
+        const now = performance.now();
+        if (now - (this.last[name] || 0) < gapMs) return false;
+        this.last[name] = now;
+        return true;
+      },
+
+      // Filtered noise burst: hiss, crackle, rustle
+      hiss(dur, freq, filter = 'bandpass', vol = 0.2, q = 1, delay = 0) {
+        const c = this.ctx, t = c.currentTime + delay;
+        const src = c.createBufferSource();
+        src.buffer = this.noise;
+        const f = c.createBiquadFilter();
+        f.type = filter;
+        f.frequency.value = freq;
+        f.Q.value = q;
+        const g = c.createGain();
+        g.gain.setValueAtTime(vol, t);
+        g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+        src.connect(f).connect(g).connect(this.master);
+        src.start(t, Math.random() * 0.8, dur + 0.05);
+      },
+
+      // Pitched blip that slides in pitch: bloops, chirps, thuds
+      tone(freq, endFreq, dur, type = 'sine', vol = 0.15, delay = 0) {
+        const c = this.ctx, t = c.currentTime + delay;
+        const o = c.createOscillator();
+        o.type = type;
+        o.frequency.setValueAtTime(freq, t);
+        o.frequency.exponentialRampToValueAtTime(endFreq, t + dur);
+        const g = c.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(vol, t + 0.005);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        o.connect(g).connect(this.master);
+        o.start(t);
+        o.stop(t + dur + 0.02);
+      },
+
+      // Sound of drawing each material
+      paint(el) {
+        if (!this.ok('paint', 70)) return;
+        const r = Math.random();
+        switch (el) {
+          case SAND:  this.hiss(0.06, 2500 + r * 1500, 'bandpass', 0.18, 0.8); break;
+          case DIRT:  this.hiss(0.08, 500 + r * 300, 'lowpass', 0.3); break;
+          case WATER: { const f = 350 + r * 500; this.tone(f, f * 1.8, 0.07, 'sine', 0.12); break; }
+          case FIRE:  this.hiss(0.04, 2000 + r * 2000, 'highpass', 0.12); break;
+          case LAVA:  this.tone(90 + r * 30, 45, 0.25, 'sine', 0.25); this.hiss(0.15, 300, 'lowpass', 0.15); break;
+          case PLANT: this.tone(700 + r * 300, 1100, 0.05, 'triangle', 0.06); break;
+          case ACID:  this.hiss(0.1, 5000, 'highpass', 0.08); break;
+          case EMPTY: this.hiss(0.05, 800, 'bandpass', 0.12, 0.7); break;
+          default:    this.hiss(0.03, 1200 + r * 600, 'bandpass', 0.2, 5); // wood, stone, wall: knock
+        }
+      },
+
+      // Sounds from what happened in the simulation this frame
+      react(e) {
+        if (e.steam && this.ok('steam', 160)) this.hiss(0.3, 3500, 'highpass', Math.min(0.25, 0.04 + e.steam * 0.01));
+        if (e.fizz && this.ok('fizz', 90)) this.hiss(0.08, 6000, 'bandpass', 0.07, 2);
+        if (e.fires && Math.random() < Math.min(1, e.fires / 120) && this.ok('crackle', 25)) {
+          this.hiss(0.02 + Math.random() * 0.04, 1500 + Math.random() * 3000, 'highpass', 0.05 + Math.random() * 0.12);
+        }
+        if (e.sprout && this.ok('sprout', 120)) this.tone(900 + Math.random() * 300, 1400, 0.06, 'sine', 0.04);
+        if (e.tree && this.ok('tree', 300)) this.tone(500, 1000, 0.15, 'triangle', 0.07);
+        if (e.crown && this.ok('crown', 300)) {
+          this.tone(660, 670, 0.35, 'sine', 0.04);
+          this.tone(990, 1000, 0.35, 'sine', 0.03);
+        }
+      },
+
+      // Crickets at night, birds during the day
+      ambient() {
+        if (daylight < 0.2 && Math.random() < 0.012 && this.ok('cricket', 400)) {
+          for (let k = 0; k < 3; k++) this.tone(4300, 4200, 0.03, 'sine', 0.025, k * 0.07);
+        } else if (daylight > 0.8 && Math.random() < 0.004 && this.ok('bird', 1500)) {
+          const f = 2200 + Math.random() * 1200;
+          this.tone(f, f * 1.4, 0.09, 'sine', 0.035);
+          this.tone(f * 1.2, f * 0.9, 0.12, 'sine', 0.03, 0.12);
+        }
+      },
+    };
+
+    ['pointerdown', 'keydown'].forEach(name => window.addEventListener(name, () => Sound.init()));
+
+    // ---------- Speed, sound, background and day/night controls ----------
+    const SPEEDS = [0.25, 0.5, 1, 2, 3, 4];
+    let speedIdx = 2;
+    let stepAcc = 0; // fractional steps carried between frames (for slow motion)
+
+    const speedVal = document.getElementById('speedVal');
+    function setSpeed(idx) {
+      speedIdx = Math.max(0, Math.min(SPEEDS.length - 1, idx));
+      const s = SPEEDS[speedIdx];
+      speedVal.textContent = `Speed ${s === 0.25 ? '¼' : s === 0.5 ? '½' : s}×`;
+      savePrefs();
+    }
+    document.getElementById('slower').onclick = () => setSpeed(speedIdx - 1);
+    document.getElementById('faster').onclick = () => setSpeed(speedIdx + 1);
+
+    const soundBtn = document.getElementById('sound');
+    function setSound(on) {
+      Sound.enabled = on;
+      soundBtn.textContent = on ? '🔊 Sound on' : '🔇 Sound off';
+      if (on) Sound.init();
+      savePrefs();
+    }
+    soundBtn.onclick = () => setSound(!Sound.enabled);
+
+    const bgSelect = document.getElementById('bg');
+    function setBackground(kind) {
+      if (![...bgSelect.options].some(o => o.value === kind)) return;
+      bgKind = kind;
+      bgSelect.value = kind;
+      bg = buildBackground(kind);
+      updateSky();
+      savePrefs();
+    }
+    bgSelect.onchange = () => { setBackground(bgSelect.value); bgSelect.blur(); };
+
+    const cycleBtn = document.getElementById('cycle');
+    function setCycle(on) {
+      cycleOn = on;
+      cycleBtn.textContent = on ? 'Day/night: on' : 'Day/night: paused';
+      savePrefs();
+    }
+    cycleBtn.onclick = () => setCycle(!cycleOn);
+
+    const clockEl = document.getElementById('clock');
+    function updateClock() {
+      const minutes = Math.floor(((timeOfDay * 24 + 6) % 24) * 60);
+      const hh = String(Math.floor(minutes / 60)).padStart(2, '0');
+      const mm = String(Math.floor(minutes % 60 / 10) * 10).padStart(2, '0');
+      clockEl.textContent = `${daylight > 0.5 ? '☀️' : '🌙'} ${hh}:${mm}`;
+    }
+
+    // Remember settings in this browser (best effort; works without storage too)
+    let prefsLoaded = false;
+    function savePrefs() {
+      if (!prefsLoaded) return;
+      try {
+        localStorage.setItem('fallingSandPrefs', JSON.stringify({ bgKind, cycleOn, speedIdx, sound: Sound.enabled }));
+      } catch (e) {}
+    }
+    try {
+      const p = JSON.parse(localStorage.getItem('fallingSandPrefs') || '{}');
+      if (typeof p.bgKind === 'string') setBackground(p.bgKind);
+      if (typeof p.cycleOn === 'boolean') setCycle(p.cycleOn);
+      if (typeof p.speedIdx === 'number') setSpeed(p.speedIdx);
+      if (typeof p.sound === 'boolean') setSound(p.sound);
+    } catch (e) {}
+    prefsLoaded = true;
+    updateSky();
+    updateClock();
+
     window.addEventListener('keydown', e => {
-      if (e.target.tagName === 'INPUT') return;
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
       const tool = TOOLS.find(t => t.key === e.key.toUpperCase());
       if (tool) selectTool(tool.el);
       else if (e.key === ' ') { e.preventDefault(); togglePause(); }
       else if (e.key === 'c' || e.key === 'C') clearAll();
       else if (e.key === '[') setBrush(brushSize - 1);
       else if (e.key === ']') setBrush(brushSize + 1);
+      else if (e.key === '-' || e.key === '_') setSpeed(speedIdx - 1);
+      else if (e.key === '=' || e.key === '+') setSpeed(speedIdx + 1);
+      else if (e.key === 'n' || e.key === 'N') setCycle(!cycleOn);
+      else if (e.key === 'm' || e.key === 'M') setSound(!Sound.enabled);
     });
 
     // ---------- Main loop ----------
@@ -599,8 +993,24 @@
     let fpsFrames = 0, fpsTime = performance.now();
 
     function loop(now) {
-      if (pointer.down) paintAt(pointer.x, pointer.y); // keep pouring while held
-      if (!paused) step();
+      if (pointer.down) {
+        paintAt(pointer.x, pointer.y); // keep pouring while held
+        Sound.paint(pointer.erase ? EMPTY : current);
+      }
+      if (!paused) {
+        stepAcc += SPEEDS[speedIdx];
+        while (stepAcc >= 1) {
+          stepAcc--;
+          step();
+          if (cycleOn) timeOfDay = (timeOfDay + 1 / DAY_STEPS) % 1;
+        }
+        if (Sound.running()) {
+          Sound.react(ev);
+          if (cycleOn && bg.celestial) Sound.ambient();
+        }
+      }
+      for (const k in ev) ev[k] = 0;
+      if (frame % 2 === 0) updateSky();
       render();
 
       fpsFrames++;
@@ -609,6 +1019,7 @@
         for (let i = 0; i < N; i++) if (type[i] !== EMPTY) count++;
         const fps = Math.round(fpsFrames * 1000 / (now - fpsTime));
         statsEl.textContent = `${count.toLocaleString()} particles · ${fps} fps`;
+        updateClock();
         fpsFrames = 0;
         fpsTime = now;
       }
