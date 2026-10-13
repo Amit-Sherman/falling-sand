@@ -120,11 +120,12 @@
     </div>
 
     <p class="help">
-      <strong>Try:</strong> lava + water → stone and steam ·
-      plants grow by drinking water · fire spreads through plants and wood ·
+      <strong>Try:</strong> pour water on dirt → grass and trees grow ·
+      lava + water → stone and steam ·
+      plants grow by drinking water · fire spreads through plants, trees and wood ·
       acid eats almost everything except walls ·
       sand sinks through water.<br>
-      <strong>Keys:</strong> 1–9, 0 pick a material · Space pause · C clear · [ ] brush size
+      <strong>Keys:</strong> 1–9, 0 pick a material · E eraser · Space pause · C clear · [ ] brush size
     </p>
   </div>
 
@@ -133,18 +134,23 @@
     const W = 240, H = 160, N = W * H;
 
     const EMPTY = 0, WALL = 1, SAND = 2, WATER = 3, FIRE = 4, LAVA = 5,
-          PLANT = 6, ACID = 7, WOOD = 8, STONE = 9, STEAM = 10, SMOKE = 11;
+          PLANT = 6, ACID = 7, WOOD = 8, STONE = 9, STEAM = 10, SMOKE = 11,
+          DIRT = 12, TREE = 13, LEAF = 14;
+    const NUM_TYPES = 16;
 
     const type  = new Uint8Array(N);   // which element is in each cell
-    const life  = new Uint16Array(N);  // remaining lifetime (fire, steam, smoke)
+    const life  = new Uint16Array(N);  // lifetime (fire, steam, smoke), moisture (dirt), growth energy (tree)
     const shade = new Uint8Array(N);   // 0-15 color variation per particle
+    const dir   = new Int8Array(N);    // growth direction of a tree tip: 0 up, -1/1 diagonal branch
     const done  = new Uint32Array(N);  // frame number when cell was last updated
     let frame = 1;
 
     // Density decides who can push whom. Solids are 255 so nothing moves them.
-    const DENS = new Uint8Array(12);
-    DENS[WATER] = 2; DENS[ACID] = 3; DENS[LAVA] = 4; DENS[SAND] = 5; DENS[STONE] = 6;
-    DENS[WALL] = DENS[PLANT] = DENS[WOOD] = 255;
+    const DENS = new Uint8Array(NUM_TYPES);
+    DENS[WATER] = 2; DENS[ACID] = 3; DENS[LAVA] = 4; DENS[SAND] = 5; DENS[DIRT] = 5; DENS[STONE] = 6;
+    DENS[WALL] = DENS[PLANT] = DENS[WOOD] = DENS[TREE] = DENS[LEAF] = 255;
+
+    const FLAMMABLE = new Set([PLANT, WOOD, TREE, LEAF]);
 
     const isLiquid = t => t === WATER || t === ACID || t === LAVA;
     const inb = (x, y) => x >= 0 && x < W && y >= 0 && y < H;
@@ -164,6 +170,7 @@
       type[i] = t;
       life[i] = initLife(t);
       shade[i] = rand() * 16 | 0;
+      dir[i] = 0;
       done[i] = frame;
     }
 
@@ -171,6 +178,7 @@
       let t = type[i];  type[i] = type[j];   type[j] = t;
       t = life[i];      life[i] = life[j];   life[j] = t;
       t = shade[i];     shade[i] = shade[j]; shade[j] = t;
+      t = dir[i];       dir[i] = dir[j];     dir[j] = t;
       done[i] = frame;  done[j] = frame;
     }
 
@@ -239,9 +247,10 @@
           if (rand() < 0.3) set(n, STEAM);
           return;
         }
-        if (nt === PLANT || nt === WOOD) {
+        if (FLAMMABLE.has(nt)) {
           touchingFuel = true;
-          if (nt === PLANT && rand() < 0.12) set(n, FIRE);
+          if ((nt === PLANT || nt === TREE) && rand() < 0.12) set(n, FIRE);
+          else if (nt === LEAF && rand() < 0.2) set(n, FIRE);
           else if (nt === WOOD && rand() < 0.02) { set(n, FIRE); life[n] += 60; }
         }
       }
@@ -256,7 +265,7 @@
         if (!inb(nx, ny)) continue;
         const n = ny * W + nx, nt = type[n];
         if (nt === WATER) { set(i, STONE); set(n, STEAM); return; }
-        if ((nt === PLANT || nt === WOOD) && rand() < 0.1) set(n, FIRE);
+        if (FLAMMABLE.has(nt) && rand() < 0.1) set(n, FIRE);
       }
       if (y > 0 && type[i - W] === EMPTY && rand() < 0.003) set(i - W, FIRE);
       if (rand() < 0.4) flow(x, y, i, LAVA, 1); // lava is thick and slow
@@ -267,7 +276,7 @@
         const nx = x + dx, ny = y + dy;
         if (!inb(nx, ny)) continue;
         const n = ny * W + nx;
-        if (type[n] === WATER && rand() < 0.02) set(n, PLANT);
+        if (type[n] === WATER && rand() < 0.004) set(n, PLANT);
       }
     }
 
@@ -276,12 +285,91 @@
       const nx = x + dx, ny = y + dy;
       if (inb(nx, ny)) {
         const n = ny * W + nx, nt = type[n];
-        if ((nt === SAND || nt === PLANT || nt === WOOD || nt === STONE) && rand() < 0.15) {
+        if ((nt === SAND || nt === DIRT || nt === STONE || FLAMMABLE.has(nt)) && rand() < 0.15) {
           set(n, rand() < 0.3 ? SMOKE : EMPTY);
           if (rand() < 0.3) { set(i, EMPTY); return; } // acid gets used up
         }
       }
       flow(x, y, i, ACID, 3);
+    }
+
+    // Dirt soaks up water. Wet dirt sprouts grass or a tree seedling above it.
+    function updateDirt(x, y, i) {
+      if (life[i] < 100) {
+        const [dx, dy] = DIRS4[rand() * 4 | 0];
+        const nx = x + dx, ny = y + dy;
+        if (inb(nx, ny) && type[ny * W + nx] === WATER && rand() < 0.4) {
+          set(ny * W + nx, EMPTY);
+          life[i] = 400 + (rand() * 200 | 0);
+        }
+      }
+      if (life[i] > 0) {
+        life[i]--; // slowly dries out
+        // Moisture soaks down into drier dirt, so the top layer can keep drinking
+        const below = i + W;
+        if (y + 1 < H && type[below] === DIRT && life[below] + 100 < life[i] && rand() < 0.01) {
+          life[below] = life[i];
+          life[i] = 0;
+          return;
+        }
+        const up = i - W;
+        if (y > 0 && rand() < 0.01) {
+          // Trees need open sky above them (they can push through grass)
+          const room = y > 3 && type[up - W] === EMPTY && type[up - 2 * W] === EMPTY;
+          if (room && (type[up] === EMPTY || type[up] === PLANT) && rand() < 0.25) {
+            set(up, TREE);
+            life[up] = 15 + (rand() * 20 | 0); // how tall the trunk will get
+            life[i] = 0;
+          } else if (type[up] === EMPTY) {
+            set(up, PLANT);
+            life[i] = 0;
+          }
+        }
+      }
+      fall(x, y, i, DIRT, true);
+    }
+
+    function growCrown(cx, cy, r) {
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          const x = cx + dx, y = cy + dy;
+          if (dx * dx + dy * dy > r * r + r || !inb(x, y) || rand() > 0.85) continue;
+          if (type[y * W + x] === EMPTY) set(y * W + x, LEAF);
+        }
+      }
+    }
+
+    // A tree tip climbs upward leaving wood behind, sprouts side branches,
+    // and turns into a ball of leaves when it runs out of energy or room.
+    function updateTree(x, y, i) {
+      if (rand() > 0.08) return;
+      const d = dir[i];
+      const nx = x + (d !== 0 && rand() < 0.6 ? d : 0), ny = y - 1;
+      const n = ny * W + nx;
+      const blocked = !inb(nx, ny) || (type[n] !== EMPTY && type[n] !== PLANT);
+      if (life[i] === 0 || blocked) {
+        set(i, WOOD);
+        growCrown(x, y - 1, d === 0 ? 4 + (rand() * 2 | 0) : 2 + (rand() * 2 | 0));
+        return;
+      }
+      const energy = life[i] - 1;
+      set(i, WOOD);
+      // Thicker trunk near the base of tall trees
+      if (d === 0 && energy > 18 && x + 1 < W && type[i + 1] === EMPTY) set(i + 1, WOOD);
+      set(n, TREE);
+      life[n] = energy;
+      dir[n] = d;
+      // Only the main trunk branches, and not right at the ground
+      if (d === 0 && energy > 3 && energy < 22 && rand() < 0.15) {
+        const side = rand() < 0.5 ? -1 : 1;
+        const bx = x + side;
+        if (inb(bx, ny) && type[ny * W + bx] === EMPTY) {
+          const b = ny * W + bx;
+          set(b, TREE);
+          life[b] = 3 + (rand() * 5 | 0);
+          dir[b] = side;
+        }
+      }
     }
 
     function updateGas(x, y, i, t) {
@@ -303,6 +391,8 @@
           if (t === EMPTY || t === WALL || t === WOOD || done[i] === frame) continue;
           switch (t) {
             case SAND:  fall(x, y, i, t, true); break;
+            case DIRT:  updateDirt(x, y, i); break;
+            case TREE:  updateTree(x, y, i); break;
             case STONE: fall(x, y, i, t, false); break;
             case WATER:
               if (rand() < 0.01) shade[i] = rand() * 16 | 0; // shimmer
@@ -327,12 +417,16 @@
       [PLANT]: ['#3fa34d', 0.25], [ACID]:  ['#9cff3a', 0.15],
       [WOOD]:  ['#7a4a26', 0.2],  [STONE]: ['#8a8a8a', 0.2],
       [STEAM]: ['#9fb0c2', 0.1],  [SMOKE]: ['#4a4a52', 0.15],
+      [DIRT]:  ['#7a5230', 0.2],  [TREE]:  ['#9a6a3a', 0.1],
+      [LEAF]:  ['#2f8f3a', 0.35],
     };
+    const WET_DIRT = 15; // palette slot only, not a real element
+    BASE[WET_DIRT] = ['#4a3020', 0.2];
 
     const pack = (r, g, b) =>
       (255 << 24) | (Math.min(255, b) << 16) | (Math.min(255, g) << 8) | Math.min(255, r);
 
-    const palette = new Uint32Array(12 * 16);
+    const palette = new Uint32Array(NUM_TYPES * 16);
     for (const t in BASE) {
       const [hex, v] = BASE[t];
       const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
@@ -360,7 +454,9 @@
     function render() {
       for (let i = 0; i < N; i++) {
         const t = type[i];
-        pixels[i] = t === FIRE ? fireColors[Math.min(life[i], 127)] : palette[t * 16 + shade[i]];
+        if (t === FIRE) pixels[i] = fireColors[Math.min(life[i], 127)];
+        else if (t === DIRT && life[i] > 0) pixels[i] = palette[WET_DIRT * 16 + shade[i]];
+        else pixels[i] = palette[t * 16 + shade[i]];
       }
       // Brush outline
       if (pointer.inside) {
@@ -378,16 +474,17 @@
 
     // ---------- Tools & input ----------
     const TOOLS = [
-      { name: 'Sand',   el: SAND },
-      { name: 'Water',  el: WATER },
-      { name: 'Fire',   el: FIRE },
-      { name: 'Lava',   el: LAVA },
-      { name: 'Plant',  el: PLANT },
-      { name: 'Acid',   el: ACID },
-      { name: 'Wood',   el: WOOD },
-      { name: 'Stone',  el: STONE },
-      { name: 'Wall',   el: WALL },
-      { name: 'Eraser', el: EMPTY },
+      { name: 'Sand',   el: SAND,  key: '1' },
+      { name: 'Dirt',   el: DIRT,  key: '2' },
+      { name: 'Water',  el: WATER, key: '3' },
+      { name: 'Fire',   el: FIRE,  key: '4' },
+      { name: 'Lava',   el: LAVA,  key: '5' },
+      { name: 'Plant',  el: PLANT, key: '6' },
+      { name: 'Acid',   el: ACID,  key: '7' },
+      { name: 'Wood',   el: WOOD,  key: '8' },
+      { name: 'Stone',  el: STONE, key: '9' },
+      { name: 'Wall',   el: WALL,  key: '0' },
+      { name: 'Eraser', el: EMPTY, key: 'E' },
     ];
     const SOLIDS = new Set([WALL, WOOD, PLANT]);
 
@@ -396,11 +493,11 @@
     let paused = false;
 
     const toolsEl = document.getElementById('tools');
-    TOOLS.forEach((tool, n) => {
+    TOOLS.forEach(tool => {
       const btn = document.createElement('button');
       btn.className = 'tool';
       const color = tool.el === EMPTY ? 'transparent' : BASE[tool.el][0];
-      btn.innerHTML = `<span class="swatch" style="background:${color}"></span>${tool.name}<span class="key">${(n + 1) % 10}</span>`;
+      btn.innerHTML = `<span class="swatch" style="background:${color}"></span>${tool.name}<span class="key">${tool.key}</span>`;
       btn.onclick = () => selectTool(tool.el);
       tool.btn = btn;
       toolsEl.appendChild(btn);
@@ -489,10 +586,9 @@
 
     window.addEventListener('keydown', e => {
       if (e.target.tagName === 'INPUT') return;
-      if (e.key >= '0' && e.key <= '9') {
-        const n = e.key === '0' ? 9 : +e.key - 1;
-        selectTool(TOOLS[n].el);
-      } else if (e.key === ' ') { e.preventDefault(); togglePause(); }
+      const tool = TOOLS.find(t => t.key === e.key.toUpperCase());
+      if (tool) selectTool(tool.el);
+      else if (e.key === ' ') { e.preventDefault(); togglePause(); }
       else if (e.key === 'c' || e.key === 'C') clearAll();
       else if (e.key === '[') setBrush(brushSize - 1);
       else if (e.key === ']') setBrush(brushSize + 1);
