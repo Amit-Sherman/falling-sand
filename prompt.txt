@@ -1,0 +1,4 @@
+Choose a game, visualization, simulation, or tool. Three rules:
+
+    It runs entirely in the browser. No server, no backend, no database, no API keys — just HTML, CSS and JavaScript. Say this in your first prompt — GitHub Pages cannot run a backend.
+    Neither of you knows how to build it by hand. Aim above your own level. That’s the experiment.
