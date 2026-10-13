@@ -115,7 +115,7 @@
 <body>
   <div class="wrap">
     <h1>Falling Sand</h1>
-    <p class="sub">Pick a material and draw on the canvas. Right-click (or the Eraser) to erase.</p>
+    <p class="sub">Pick a material and draw on the canvas. Hold right-click and drag to move around the world.</p>
 
     <div class="tools" id="tools"></div>
 
@@ -151,6 +151,16 @@
       </label>
       <button id="cycle" title="Day/night cycle (N)">Day/night: on</button>
       <span id="clock" class="clock"></span>
+      <label>Weather
+        <select id="weather">
+          <option value="auto">Auto (changes)</option>
+          <option value="clear">Clear</option>
+          <option value="rain">Rain</option>
+          <option value="snow">Snow</option>
+          <option value="drought">Drought</option>
+        </select>
+      </label>
+      <span id="weatherNow" class="clock"></span>
     </div>
 
     <p class="help">
@@ -159,20 +169,25 @@
       plants grow by drinking water · fire spreads through plants, trees and wood ·
       acid eats almost everything except walls ·
       sand sinks through water.<br>
-      Trees grow faster in daylight.<br>
-      <strong>Keys:</strong> 1–9, 0 pick a material · E eraser · Space pause · C clear · [ ] brush size ·
-      − + speed · N day/night · M sound
+      Trees grow faster in daylight · snow melts near fire and in warm weather ·
+      drought dries up water and withers plants · a black hole swallows everything, grows, then bursts.<br>
+      <strong>Mouse:</strong> left-click draw · right-click drag to move the view (or arrow keys).<br>
+      <strong>Keys:</strong> 1–9, 0 pick a material · S snow · B black hole · E eraser · Space pause · C clear ·
+      [ ] brush size · − + speed · N day/night · M sound
     </p>
   </div>
 
   <script>
     // ---------- Grid setup ----------
-    const W = 240, H = 160, N = W * H;
+    // The world is bigger than the view; right-drag moves the camera around it
+    const W = 480, H = 240, N = W * H;   // world size in cells
+    const VW = 240, VH = 160;            // visible part (the canvas)
+    let camX = (W - VW) >> 1, camY = H - VH;
 
     const EMPTY = 0, WALL = 1, SAND = 2, WATER = 3, FIRE = 4, LAVA = 5,
           PLANT = 6, ACID = 7, WOOD = 8, STONE = 9, STEAM = 10, SMOKE = 11,
-          DIRT = 12, TREE = 13, LEAF = 14;
-    const NUM_TYPES = 16;
+          DIRT = 12, TREE = 13, LEAF = 14, SNOW = 15;
+    const NUM_TYPES = 17;
 
     const type  = new Uint8Array(N);   // which element is in each cell
     const life  = new Uint16Array(N);  // lifetime (fire, steam, smoke), moisture (dirt), growth energy (tree)
@@ -183,14 +198,15 @@
 
     // Density decides who can push whom. Solids are 255 so nothing moves them.
     const DENS = new Uint8Array(NUM_TYPES);
-    DENS[WATER] = 2; DENS[ACID] = 3; DENS[LAVA] = 4; DENS[SAND] = 5; DENS[DIRT] = 5; DENS[STONE] = 6;
+    DENS[SNOW] = 1; DENS[WATER] = 2; DENS[ACID] = 3; DENS[LAVA] = 4; DENS[SAND] = 5; DENS[DIRT] = 5; DENS[STONE] = 6;
     DENS[WALL] = DENS[PLANT] = DENS[WOOD] = DENS[TREE] = DENS[LEAF] = 255;
 
     const FLAMMABLE = new Set([PLANT, WOOD, TREE, LEAF]);
 
     // Simulation events counted each frame so the sound engine can react to them
-    const ev = { steam: 0, fizz: 0, sprout: 0, tree: 0, crown: 0, fires: 0 };
+    const ev = { steam: 0, fizz: 0, sprout: 0, tree: 0, crown: 0, fires: 0, eaten: 0, holeDied: 0 };
     let daylight = 1; // 0 at night, 1 in full day; set by the day/night cycle
+    let weather = 'clear'; // what is happening right now: clear, rain, snow or drought
 
     const isLiquid = t => t === WATER || t === ACID || t === LAVA;
     const inb = (x, y) => x >= 0 && x < W && y >= 0 && y < H;
@@ -206,12 +222,30 @@
       return 0;
     }
 
+    // ---------- Sleeping chunks ----------
+    // The world is split into 16x16 chunks. A chunk where nothing changed last step is
+    // skipped, so settled sand, still ponds and dry dirt cost almost nothing.
+    // Any change wakes its chunk (and the neighbor chunk when it is on an edge).
+    const CS = 16, CW = W / CS, CH = H / CS;
+    let awake = new Uint8Array(CW * CH).fill(1);
+    let awakeNext = new Uint8Array(CW * CH);
+
+    function wake(i) {
+      const x = i % W, y = (i - x) / W;
+      const cx = x >> 4, cy = y >> 4;
+      const x0 = (x & 15) === 0 && cx > 0 ? cx - 1 : cx, x1 = (x & 15) === 15 && cx < CW - 1 ? cx + 1 : cx;
+      const y0 = (y & 15) === 0 && cy > 0 ? cy - 1 : cy, y1 = (y & 15) === 15 && cy < CH - 1 ? cy + 1 : cy;
+      for (let b = y0; b <= y1; b++) for (let a = x0; a <= x1; a++) awakeNext[b * CW + a] = 1;
+    }
+    function wakeAll() { awakeNext.fill(1); awake.fill(1); }
+
     function set(i, t) {
       type[i] = t;
       life[i] = initLife(t);
       shade[i] = rand() * 16 | 0;
       dir[i] = 0;
       done[i] = frame;
+      wake(i);
     }
 
     function swap(i, j) {
@@ -220,6 +254,7 @@
       t = shade[i];     shade[i] = shade[j]; shade[j] = t;
       t = dir[i];       dir[i] = dir[j];     dir[j] = t;
       done[i] = frame;  done[j] = frame;
+      wake(i); wake(j);
     }
 
     // Can element t move into cell j?
@@ -231,13 +266,12 @@
       const below = i + W;
       if (canEnter(t, below)) {
         // Sinking through liquid is slower than falling through air
-        if (isLiquid(type[below]) && rand() < 0.5) return true;
+        if (isLiquid(type[below]) && rand() < 0.5) { wake(i); return true; }
         swap(i, below);
         return true;
       }
       if (!diagonal) return false;
-      const dir = rand() < 0.5 ? -1 : 1;
-      for (const d of [dir, -dir]) {
+      for (let n = 0, d = rand() < 0.5 ? -1 : 1; n < 2; n++, d = -d) {
         const nx = x + d;
         if (nx >= 0 && nx < W && canEnter(t, below + d)) {
           swap(i, below + d);
@@ -249,8 +283,7 @@
 
     function flow(x, y, i, t, spread) {
       if (fall(x, y, i, t, true)) return;
-      const dir = rand() < 0.5 ? -1 : 1;
-      for (const d of [dir, -dir]) {
+      for (let n = 0, d = rand() < 0.5 ? -1 : 1; n < 2; n++, d = -d) {
         let target = -1;
         for (let s = 1; s <= spread; s++) {
           const nx = x + d * s;
@@ -263,15 +296,15 @@
 
     function rise(x, y, i) {
       if (y === 0) return;
-      const up = i - W;
-      const opts = [up, up - 1, up + 1];
       // Some sideways drift so gases look wispy
-      if (rand() < 0.3) opts.unshift(rand() < 0.5 ? i - 1 : i + 1);
-      for (const j of opts) {
-        const jx = j % W;
-        if (Math.abs(jx - x) > 1) continue; // wrapped around an edge
-        if (j >= 0 && type[j] === EMPTY) { swap(i, j); return; }
+      if (rand() < 0.3) {
+        const d = rand() < 0.5 ? -1 : 1;
+        if (x + d >= 0 && x + d < W && type[i + d] === EMPTY) { swap(i, i + d); return; }
       }
+      const up = i - W;
+      if (type[up] === EMPTY) { swap(i, up); return; }
+      if (x > 0 && type[up - 1] === EMPTY) { swap(i, up - 1); return; }
+      if (x < W - 1 && type[up + 1] === EMPTY) swap(i, up + 1);
     }
 
     // ---------- Element rules ----------
@@ -288,6 +321,7 @@
           if (rand() < 0.3) set(n, STEAM);
           return;
         }
+        if (nt === SNOW && rand() < 0.3) set(n, WATER);
         if (FLAMMABLE.has(nt)) {
           touchingFuel = true;
           if ((nt === PLANT || nt === TREE) && rand() < 0.12) set(n, FIRE);
@@ -306,6 +340,7 @@
         if (!inb(nx, ny)) continue;
         const n = ny * W + nx, nt = type[n];
         if (nt === WATER) { set(i, STONE); set(n, STEAM); ev.steam++; return; }
+        if (nt === SNOW) { set(n, STEAM); ev.steam++; }
         if (FLAMMABLE.has(nt) && rand() < 0.1) set(n, FIRE);
       }
       if (y > 0 && type[i - W] === EMPTY && rand() < 0.003) set(i - W, FIRE);
@@ -313,11 +348,19 @@
     }
 
     function updatePlant(x, y, i) {
+      if (weather === 'drought') {
+        wake(i);
+        if (rand() < 0.0004) { set(i, EMPTY); return; }    // withers away
+        if (rand() < 0.000002) { set(i, FIRE); return; }   // wildfire!
+      }
       for (const [dx, dy] of DIRS4) {
         const nx = x + dx, ny = y + dy;
         if (!inb(nx, ny)) continue;
         const n = ny * W + nx;
-        if (type[n] === WATER && rand() < 0.004) set(n, PLANT);
+        if (type[n] === WATER) {
+          wake(i); // keep checking while there is water to drink
+          if (rand() < 0.004) set(n, PLANT);
+        }
       }
     }
 
@@ -337,6 +380,10 @@
 
     // Dirt soaks up water. Wet dirt sprouts grass or a tree seedling above it.
     function updateDirt(x, y, i) {
+      // Stay awake while wet, or while dry but touching water
+      if (life[i] > 0 ||
+          (y + 1 < H && type[i + W] === WATER) || (y > 0 && type[i - W] === WATER) ||
+          (x + 1 < W && type[i + 1] === WATER) || (x > 0 && type[i - 1] === WATER)) wake(i);
       if (life[i] < 100) {
         const [dx, dy] = DIRS4[rand() * 4 | 0];
         const nx = x + dx, ny = y + dy;
@@ -346,7 +393,7 @@
         }
       }
       if (life[i] > 0) {
-        life[i]--; // slowly dries out
+        life[i] = Math.max(0, life[i] - (weather === 'drought' ? 4 : 1)); // dries out
         // Moisture soaks down into drier dirt, so the top layer can keep drinking
         const below = i + W;
         if (y + 1 < H && type[below] === DIRT && life[below] + 100 < life[i] && rand() < 0.01) {
@@ -386,6 +433,7 @@
     // A tree tip climbs upward leaving wood behind, sprouts side branches,
     // and turns into a ball of leaves when it runs out of energy or room.
     function updateTree(x, y, i) {
+      wake(i);
       if (rand() > 0.08 * (0.25 + 0.75 * daylight)) return; // slower at night
       const d = dir[i];
       const nx = x + (d !== 0 && rand() < 0.6 ? d : 0), ny = y - 1;
@@ -419,39 +467,173 @@
 
     function updateGas(x, y, i, t) {
       if (--life[i] <= 0) {
-        set(i, t === STEAM && rand() < 0.4 ? WATER : EMPTY); // steam condenses
+        set(i, t === STEAM && weather !== 'drought' && rand() < 0.4 ? WATER : EMPTY); // steam condenses
         return;
       }
       rise(x, y, i);
     }
 
-    function step() {
-      frame++;
-      const leftToRight = frame & 1; // alternate scan direction to avoid bias
-      for (let y = H - 1; y >= 0; y--) {
-        for (let k = 0; k < W; k++) {
-          const x = leftToRight ? k : W - 1 - k;
-          const i = y * W + x;
-          const t = type[i];
-          if (t === EMPTY || t === WALL || t === WOOD || done[i] === frame) continue;
-          switch (t) {
-            case SAND:  fall(x, y, i, t, true); break;
-            case DIRT:  updateDirt(x, y, i); break;
-            case TREE:  updateTree(x, y, i); break;
-            case STONE: fall(x, y, i, t, false); break;
-            case WATER:
-              if (rand() < 0.01) shade[i] = rand() * 16 | 0; // shimmer
-              flow(x, y, i, t, 4);
-              break;
-            case ACID:  updateAcid(x, y, i); break;
-            case LAVA:  updateLava(x, y, i); break;
-            case FIRE:  ev.fires++; updateFire(x, y, i); break;
-            case PLANT: updatePlant(x, y, i); break;
-            case STEAM:
-            case SMOKE: updateGas(x, y, i, t); break;
+    // Snowflakes drift down slowly and pile up; they melt in warm weather
+    function updateSnow(x, y, i) {
+      const melt = weather === 'snow' ? 0 : weather === 'drought' ? 0.01 : 0.0004 * (0.3 + daylight);
+      if (rand() < melt) { set(i, WATER); return; }
+      if (melt > 0) wake(i);
+      if (rand() < 0.4) {
+        // Falls slower than sand; stay awake if there is somewhere to fall
+        if (y + 1 < H && (DENS[type[i + W]] < DENS[SNOW] ||
+            (x > 0 && type[i + W - 1] === EMPTY) || (x + 1 < W && type[i + W + 1] === EMPTY))) wake(i);
+        return;
+      }
+      if (y + 1 < H && rand() < 0.3) {
+        const d = rand() < 0.5 ? -1 : 1;
+        if (x + d >= 0 && x + d < W && type[i + W + d] === EMPTY) { swap(i, i + W + d); return; }
+      }
+      fall(x, y, i, SNOW, true);
+    }
+
+    // ---------- Weather ----------
+    let weatherMode = 'auto';   // what the player picked
+    let weatherTimer = 1500;    // steps until auto weather changes
+    function stepWeather() {
+      if (weatherMode === 'auto' && --weatherTimer <= 0) {
+        const r = rand();
+        weather = r < 0.4 ? 'clear' : r < 0.65 ? 'rain' : r < 0.82 ? 'snow' : 'drought';
+        weatherTimer = 1500 + (rand() * 2000 | 0);
+        wakeAll(); // drought, melting etc. affect cells that were asleep
+        updateWeatherLabel();
+      }
+      // Drops and flakes appear along the top of the world
+      const rate = weather === 'rain' ? W * 0.0025 : weather === 'snow' ? W * 0.002 : 0;
+      const count = Math.floor(rate) + (rand() < rate % 1 ? 1 : 0);
+      for (let k = 0; k < count; k++) {
+        const i = rand() * W | 0;
+        if (type[i] === EMPTY) set(i, weather === 'rain' ? WATER : SNOW);
+      }
+    }
+
+    // ---------- Black holes ----------
+    // Holes are not cells: they float over the grid, pull loose particles in a spiral,
+    // eat everything that reaches their core (even walls), grow, and finally burst.
+    const holes = [];
+    const MAX_HOLES = 5, HOLE_LIFE = 900;
+
+    function addHole(x, y) {
+      if (holes.length >= MAX_HOLES) holes.shift();
+      holes.push({ x, y, mass: 0, age: 0 });
+      Sound.holeBorn();
+    }
+
+    function holeRadius(h) {
+      const grown = Math.min(12, 2.5 + Math.sqrt(h.mass) / 4);
+      const left = HOLE_LIFE - h.age;
+      return left < 90 ? Math.max(0.8, grown * left / 90) : grown; // shrinks before dying
+    }
+
+    function updateHoles() {
+      for (let n = holes.length - 1; n >= 0; n--) {
+        const h = holes[n];
+        if (++h.age >= HOLE_LIFE) {
+          // Dies in a burst of sparks
+          for (let k = 0; k < 60; k++) {
+            const a = rand() * Math.PI * 2, d = 2 + rand() * 8;
+            const x = Math.round(h.x + Math.cos(a) * d), y = Math.round(h.y + Math.sin(a) * d);
+            if (inb(x, y) && type[y * W + x] === EMPTY) set(y * W + x, FIRE);
+          }
+          holes.splice(n, 1);
+          ev.holeDied++;
+          continue;
+        }
+        const r = holeRadius(h), R = r * 5 + 10, ri = Math.ceil(r);
+        // Eat everything inside the core
+        for (let dy = -ri; dy <= ri; dy++) {
+          for (let dx = -ri; dx <= ri; dx++) {
+            const x = h.x + dx, y = h.y + dy;
+            if (dx * dx + dy * dy > r * r || !inb(x, y)) continue;
+            const i = y * W + x;
+            if (type[i] !== EMPTY) { set(i, EMPTY); h.mass++; ev.eaten++; }
+          }
+        }
+        // Pull loose particles inward, with a sideways swirl
+        const samples = R * R * 1.2 | 0;
+        for (let k = 0; k < samples; k++) {
+          const a = rand() * Math.PI * 2, d = Math.sqrt(rand()) * R;
+          const px = Math.round(h.x + Math.cos(a) * d), py = Math.round(h.y + Math.sin(a) * d);
+          if (!inb(px, py)) continue;
+          const i = py * W + px, t = type[i];
+          if (t === EMPTY || DENS[t] === 255 || rand() < d / R) continue; // solids stay put; pull is stronger near the core
+          const vx = h.x - px, vy = h.y - py;
+          const sx = Math.sign(vx - vy * 0.8), sy = Math.sign(vy + vx * 0.8);
+          const tx = px + sx, ty = py + sy;
+          if (!inb(tx, ty)) continue;
+          const j = ty * W + tx;
+          if (type[j] === EMPTY || DENS[type[j]] < DENS[t]) swap(i, j);
+        }
+      }
+      // Two holes that touch merge into one
+      for (let a = 0; a < holes.length; a++) {
+        for (let b = holes.length - 1; b > a; b--) {
+          const A = holes[a], B = holes[b];
+          if (Math.hypot(A.x - B.x, A.y - B.y) < holeRadius(A) + holeRadius(B)) {
+            A.mass += B.mass + 20;
+            A.age = Math.min(A.age, B.age);
+            holes.splice(b, 1);
           }
         }
       }
+    }
+
+    function updateCell(x, y, i) {
+      const t = type[i];
+      if (t === EMPTY || t === WALL || t === WOOD || done[i] === frame) return;
+      switch (t) {
+        case SAND:  fall(x, y, i, t, true); break;
+        case STONE: fall(x, y, i, t, false); break;
+        case DIRT:  updateDirt(x, y, i); break;
+        case TREE:  updateTree(x, y, i); break;
+        case WATER:
+          if (rand() < 0.01) shade[i] = rand() * 16 | 0; // shimmer
+          // Drought: water open to the air evaporates
+          if (weather === 'drought' && y > 0 && type[i - W] === EMPTY) {
+            wake(i);
+            if (rand() < 0.003) { set(i, rand() < 0.5 ? STEAM : EMPTY); break; }
+          }
+          flow(x, y, i, t, 4);
+          break;
+        case SNOW:  updateSnow(x, y, i); break;
+        case LEAF:
+          if (weather === 'drought') {
+            wake(i);
+            if (rand() < 0.0003) set(i, EMPTY); // leaves drop
+          }
+          break;
+        case PLANT: updatePlant(x, y, i); break;
+        // These change every step even when they don't move, so they keep their chunk awake
+        case ACID:  wake(i); updateAcid(x, y, i); break;
+        case LAVA:  wake(i); updateLava(x, y, i); break;
+        case FIRE:  wake(i); ev.fires++; updateFire(x, y, i); break;
+        case STEAM:
+        case SMOKE: wake(i); updateGas(x, y, i, t); break;
+      }
+    }
+
+    function step() {
+      frame++;
+      stepWeather();
+      updateHoles();
+      const leftToRight = frame & 1; // alternate scan direction to avoid bias
+      for (let y = H - 1; y >= 0; y--) {
+        const chunkRow = (y >> 4) * CW, row = y * W;
+        for (let c = 0; c < CW; c++) {
+          const cx = leftToRight ? c : CW - 1 - c;
+          if (!awake[chunkRow + cx]) continue;
+          const x0 = cx * CS;
+          if (leftToRight) for (let x = x0; x < x0 + CS; x++) updateCell(x, y, row + x);
+          else for (let x = x0 + CS - 1; x >= x0; x--) updateCell(x, y, row + x);
+        }
+      }
+      // Chunks that saw changes this step get processed next step
+      const t = awake; awake = awakeNext; awakeNext = t;
+      awakeNext.fill(0);
     }
 
     // ---------- Colors ----------
@@ -463,9 +645,9 @@
       [WOOD]:  ['#7a4a26', 0.2],  [STONE]: ['#8a8a8a', 0.2],
       [STEAM]: ['#9fb0c2', 0.1],  [SMOKE]: ['#4a4a52', 0.15],
       [DIRT]:  ['#7a5230', 0.2],  [TREE]:  ['#9a6a3a', 0.1],
-      [LEAF]:  ['#2f8f3a', 0.35],
+      [LEAF]:  ['#2f8f3a', 0.35], [SNOW]:  ['#eef3f8', 0.06],
     };
-    const WET_DIRT = 15; // palette slot only, not a real element
+    const WET_DIRT = 16; // palette slot only, not a real element
     BASE[WET_DIRT] = ['#4a3020', 0.2];
 
     const pack = (r, g, b) =>
@@ -500,15 +682,18 @@
 
     // ---------- Rendering ----------
     const canvas = document.getElementById('canvas');
-    canvas.width = W;
-    canvas.height = H;
+    canvas.width = VW;
+    canvas.height = VH;
     const ctx = canvas.getContext('2d');
-    const image = ctx.createImageData(W, H);
+    const image = ctx.createImageData(VW, VH);
     const pixels = new Uint32Array(image.data.buffer);
 
     // ---------- Backgrounds & day/night ----------
+    // The background is scenery fixed to the screen, so it is sized to the view, not the world
+    const VN = VW * VH;
+    const inView = (x, y) => x >= 0 && x < VW && y >= 0 && y < VH;
     const DAY_STEPS = 5400;   // one full day = 90 seconds at normal speed
-    const HORIZON = Math.round(H * 0.62);
+    const HORIZON = Math.round(VH * 0.62);
     let timeOfDay = 0.12;     // 0 sunrise, 0.25 noon, 0.5 sunset, 0.75 midnight
     let cycleOn = true;
     let bgKind = 'hills';
@@ -534,25 +719,25 @@
 
     // Builds the background as three RGB images (day, dusk, night) that get blended over time
     function buildBackground(kind) {
-      const bufs = [0, 1, 2].map(() => new Uint8ClampedArray(N * 3));
-      const sky = new Uint8Array(N); // 1 where the sky shows (stars, sun and moon go there)
-      const far = new Float32Array(W), near = new Float32Array(W);
-      for (let x = 0; x < W; x++) {
+      const bufs = [0, 1, 2].map(() => new Uint8ClampedArray(VN * 3));
+      const sky = new Uint8Array(VN); // 1 where the sky shows (stars, sun and moon go there)
+      const far = new Float32Array(VW), near = new Float32Array(VW);
+      for (let x = 0; x < VW; x++) {
         if (kind === 'hills') {
-          far[x]  = H * 0.5  + Math.sin(x * 0.03) * 9 + Math.sin(x * 0.071 + 1) * 5;
-          near[x] = H * 0.68 + Math.sin(x * 0.045 + 2) * 8 + Math.sin(x * 0.13) * 3;
+          far[x]  = VH * 0.5  + Math.sin(x * 0.03) * 9 + Math.sin(x * 0.071 + 1) * 5;
+          near[x] = VH * 0.68 + Math.sin(x * 0.045 + 2) * 8 + Math.sin(x * 0.13) * 3;
         } else if (kind === 'desert') {
-          far[x]  = H * 0.58 + Math.sin(x * 0.022 + 0.5) * 7 + Math.sin(x * 0.05) * 3;
-          near[x] = H * 0.72 + Math.sin(x * 0.03 + 2.2) * 6 + Math.sin(x * 0.08) * 2;
+          far[x]  = VH * 0.58 + Math.sin(x * 0.022 + 0.5) * 7 + Math.sin(x * 0.05) * 3;
+          near[x] = VH * 0.72 + Math.sin(x * 0.03 + 2.2) * 6 + Math.sin(x * 0.08) * 2;
         }
       }
       // City skyline: buildings of random width and height
-      const roof = new Float32Array(W).fill(H), bStart = new Int16Array(W), bShade = new Uint8Array(W);
+      const roof = new Float32Array(VW).fill(VH), bStart = new Int16Array(VW), bShade = new Uint8Array(VW);
       if (kind === 'city') {
         let x = 0, n = 0;
-        while (x < W) {
-          const w = 6 + (hash(n, 1) * 11 | 0), top = H * (0.3 + hash(n, 2) * 0.35), gap = hash(n, 3) * 3 | 0;
-          for (let k = x; k < Math.min(W, x + w); k++) { roof[k] = top; bStart[k] = x; bShade[k] = n & 1; }
+        while (x < VW) {
+          const w = 6 + (hash(n, 1) * 11 | 0), top = VH * (0.3 + hash(n, 2) * 0.35), gap = hash(n, 3) * 3 | 0;
+          for (let k = x; k < Math.min(VW, x + w); k++) { roof[k] = top; bStart[k] = x; bShade[k] = n & 1; }
           x += w + gap;
           n++;
         }
@@ -560,25 +745,25 @@
 
       for (let p = 0; p < 3; p++) {
         const buf = bufs[p];
-        for (let y = 0; y < H; y++) {
-          for (let x = 0; x < W; x++) {
-            const i = y * W + x;
+        for (let y = 0; y < VH; y++) {
+          for (let x = 0; x < VW; x++) {
+            const i = y * VW + x;
             let c, isSky = 1;
             if (kind === 'plain') {
               c = [13, 15, 20]; isSky = 0;
             } else if (kind === 'space') {
-              const d1 = Math.hypot(x - W * 0.3, y - H * 0.35) / 55, d2 = Math.hypot(x - W * 0.75, y - H * 0.6) / 45;
+              const d1 = Math.hypot(x - VW * 0.3, y - VH * 0.35) / 55, d2 = Math.hypot(x - VW * 0.75, y - VH * 0.6) / 45;
               const a = Math.exp(-d1 * d1), b = Math.exp(-d2 * d2);
               c = [6 + 70 * a + 20 * b, 6 + 20 * a + 50 * b, 16 + 90 * a + 90 * b];
             } else {
-              const sy = kind === 'sky' ? y / H : Math.min(1, y / HORIZON);
+              const sy = kind === 'sky' ? y / VH : Math.min(1, y / HORIZON);
               c = mix(PH.skyTop[p], PH.skyBottom[p], sy);
               if (kind === 'hills' || kind === 'desert') {
                 const [fc, nc] = kind === 'hills' ? [PH.hillFar, PH.hillNear] : [PH.duneFar, PH.duneNear];
                 if (y > near[x]) { c = nc[p]; isSky = 0; }
                 else if (y > far[x]) { c = fc[p]; isSky = 0; }
               } else if (kind === 'ocean' && y >= HORIZON) {
-                c = mix(PH.seaTop[p], PH.seaBottom[p], (y - HORIZON) / (H - HORIZON));
+                c = mix(PH.seaTop[p], PH.seaBottom[p], (y - HORIZON) / (VH - HORIZON));
                 if (hash(x >> 2, y) < 0.08) c = mix(c, [255, 255, 255], 0.12); // wave glints
                 isSky = 0;
               } else if (kind === 'city' && y >= roof[x]) {
@@ -601,7 +786,7 @@
     }
 
     let bg = buildBackground(bgKind);
-    const bgPixels = new Uint32Array(N);
+    const bgPixels = new Uint32Array(VN);
 
     // How much of each phase to show, from the sun's height (-1 midnight .. 1 noon)
     function phaseWeights(s) {
@@ -613,15 +798,15 @@
 
     // Draw a sun or moon traveling in an arc across the sky (u: 0 rising .. 1 setting)
     function drawBody(u, radius, color, glow, crescent) {
-      const cx = -10 + (W + 20) * u;
+      const cx = -10 + (VW + 20) * u;
       const cy = HORIZON - Math.sin(Math.PI * u) * (HORIZON - 18);
       const reach = radius + glow;
       for (let dy = -reach; dy <= reach; dy++) {
         for (let dx = -reach; dx <= reach; dx++) {
           const x = Math.round(cx + dx), y = Math.round(cy + dy);
-          if (!inb(x, y) || !bg.sky[y * W + x]) continue;
+          if (!inView(x, y) || !bg.sky[y * VW + x]) continue;
           const d = Math.hypot(dx, dy);
-          const i = y * W + x;
+          const i = y * VW + x;
           if (d <= radius) {
             if (crescent && Math.hypot(dx - 2.5, dy + 1) < radius - 0.5) continue;
             bgPixels[i] = pack(color[0], color[1], color[2]);
@@ -637,19 +822,43 @@
       }
     }
 
+    let cloud = 0, haze = 0; // 0..1, ease toward the current weather
+    let skyKey = '';         // what the sky was last drawn for; redraw only when it changes
+
+    // Called every frame. Cheap unless the time of day, weather or background changed.
     function updateSky() {
       const s = Math.sin(2 * Math.PI * timeOfDay);
       daylight = Math.max(0, Math.min(1, (s + 0.15) / 0.4));
-      lightLevel = bg.celestial ? Math.round(daylight * (LIGHT_LEVELS - 1)) : LIGHT_LEVELS - 1;
-      const [wd, wk, wn] = phaseWeights(s);
+      // Clouds fade in for rain and snow, heat haze for drought
+      cloud += ((weather === 'rain' || weather === 'snow' ? 1 : 0) - cloud) * 0.01;
+      haze += ((weather === 'drought' ? 1 : 0) - haze) * 0.01;
+      const light = daylight * (1 - 0.35 * cloud);
+      lightLevel = bg.celestial ? Math.round(light * (LIGHT_LEVELS - 1)) : LIGHT_LEVELS - 1;
+
+      const key = `${bgKind}|${Math.round(timeOfDay * 2000)}|${Math.round(cloud * 100)}|${Math.round(haze * 100)}`;
+      if (key === skyKey) return;
+      skyKey = key;
+
+      // Blend day/dusk/night images with whole-number weights that add up to 256
+      const [fd, fk] = phaseWeights(s);
+      const wd = Math.round(fd * 256), wk = Math.round(fk * 256), wn = 256 - wd - wk;
+      const kc = bg.celestial ? Math.round(cloud * 0.55 * 256) : 0;  // overcast: grey and dim
+      const kh = bg.celestial ? Math.round(haze * 0.3 * 256) : 0;    // drought: hot yellow haze
       const [d, k, n] = bg.bufs;
-      for (let i = 0, j = 0; i < N; i++, j += 3) {
-        bgPixels[i] = pack(
-          d[j] * wd + k[j] * wk + n[j] * wn | 0,
-          d[j + 1] * wd + k[j + 1] * wk + n[j + 1] * wn | 0,
-          d[j + 2] * wd + k[j + 2] * wk + n[j + 2] * wn | 0);
+      for (let i = 0, j = 0; i < VN; i++, j += 3) {
+        let r = (d[j] * wd + k[j] * wk + n[j] * wn) >> 8;
+        let g = (d[j + 1] * wd + k[j + 1] * wk + n[j + 1] * wn) >> 8;
+        let b = (d[j + 2] * wd + k[j + 2] * wk + n[j + 2] * wn) >> 8;
+        if (kc) {
+          const gray = ((r + g + b) >> 2) + 20;
+          r += ((gray - r) * kc) >> 8; g += ((gray - g) * kc) >> 8; b += ((gray - b) * kc) >> 8;
+        }
+        if (kh) {
+          r += ((240 - r) * kh) >> 8; g += ((190 - g) * kh) >> 8; b += ((110 - b) * kh) >> 8;
+        }
+        bgPixels[i] = 0xff000000 | (b << 16) | (g << 8) | r;
       }
-      if (bg.celestial) {
+      if (bg.celestial && cloud < 0.6) {
         if (timeOfDay < 0.5) drawBody(timeOfDay / 0.5, 6, [255, 236, 150], 10, false);
         else drawBody((timeOfDay - 0.5) / 0.5, 5, [235, 235, 215], 5, true);
       }
@@ -657,32 +866,87 @@
 
     function render() {
       const palette = palettes[lightLevel];
-      for (let i = 0; i < N; i++) {
-        const t = type[i];
-        if (t === EMPTY) pixels[i] = bgPixels[i];
-        else if (t === FIRE) pixels[i] = fireColors[Math.min(life[i], 127)];
-        else if (t === DIRT && life[i] > 0) pixels[i] = palette[WET_DIRT * 16 + shade[i]];
-        else pixels[i] = palette[t * 16 + shade[i]];
+      for (let sy = 0, o = 0; sy < VH; sy++) {
+        let i = (camY + sy) * W + camX;
+        for (let sx = 0; sx < VW; sx++, i++, o++) {
+          const t = type[i];
+          if (t === EMPTY) pixels[o] = bgPixels[o];
+          else if (t === FIRE) pixels[o] = fireColors[Math.min(life[i], 127)];
+          else if (t === DIRT && life[i] > 0) pixels[o] = palette[WET_DIRT * 16 + shade[i]];
+          else pixels[o] = palette[t * 16 + shade[i]];
+        }
       }
-      // Brush outline
-      if (pointer.inside) {
-        const r = brushSize;
+      for (const h of holes) drawHole(h);
+      // Brush outline (not for the black hole tool, which places a single hole)
+      if (pointer.inside && !pointer.panning) {
+        const r = current === HOLE_TOOL ? 3 : brushSize;
         for (let dy = -r - 1; dy <= r + 1; dy++) {
           for (let dx = -r - 1; dx <= r + 1; dx++) {
             const d = Math.sqrt(dx * dx + dy * dy);
-            const x = pointer.x + dx, y = pointer.y + dy;
-            if (Math.abs(d - r) >= 0.5 || !inb(x, y)) continue;
+            const x = pointer.x - camX + dx, y = pointer.y - camY + dy;
+            if (Math.abs(d - r) >= 0.5 || !inView(x, y)) continue;
             // Light outline on dark pixels, dark outline on light ones
-            const p = pixels[y * W + x];
+            const p = pixels[y * VW + x];
             const bright = (p & 255) + ((p >> 8) & 255) + ((p >> 16) & 255) > 400;
-            pixels[y * W + x] = bright ? 0xff222222 : 0xffdddddd;
+            pixels[y * VW + x] = bright ? 0xff222222 : 0xffdddddd;
           }
         }
       }
+      drawMinimap();
       ctx.putImageData(image, 0, 0);
     }
 
+    // Black core, a lensing shadow around it, and a swirling glowing ring
+    function drawHole(h) {
+      const r = holeRadius(h), ring = r + 3, shadow = r * 2.2 + 3;
+      const cx = h.x - camX, cy = h.y - camY;
+      const reach = Math.ceil(shadow);
+      for (let dy = -reach; dy <= reach; dy++) {
+        for (let dx = -reach; dx <= reach; dx++) {
+          const x = cx + dx, y = cy + dy;
+          if (!inView(x, y)) continue;
+          const d = Math.hypot(dx, dy), o = y * VW + x;
+          if (d > shadow) continue;
+          if (d <= r) { pixels[o] = 0xff000000; continue; }
+          const p = pixels[o];
+          let R = p & 255, G = (p >> 8) & 255, B = (p >> 16) & 255;
+          if (d <= ring) {
+            const a = Math.atan2(dy, dx) + h.age * 0.15;
+            const k = 0.5 + 0.5 * Math.sin(a * 3 - d);
+            const glow = 1 - (d - r) / 3;
+            R += ((255 * k + 140 * (1 - k)) - R) * glow;
+            G += ((150 * k + 60 * (1 - k)) - G) * glow;
+            B += ((40 * k + 255 * (1 - k)) - B) * glow;
+          } else {
+            const k = 0.6 * (1 - (d - ring) / (shadow - ring));
+            R *= 1 - k; G *= 1 - k; B *= 1 - k;
+          }
+          pixels[o] = pack(R | 0, G | 0, B | 0);
+        }
+      }
+    }
+
+    // Small map in the corner showing where the view is in the world
+    const MM = 8; // world cells per minimap pixel
+    function drawMinimap() {
+      const mw = W / MM, mh = H / MM, ox = VW - mw - 3, oy = 3;
+      for (let y = 0; y < mh; y++) {
+        for (let x = 0; x < mw; x++) {
+          const t = type[(y * MM + 2) * W + x * MM + 2];
+          const o = (oy + y) * VW + ox + x;
+          if (t !== EMPTY) { pixels[o] = palettes[LIGHT_LEVELS - 1][t * 16 + 8]; continue; }
+          const p = pixels[o]; // empty areas: just darken what is behind
+          pixels[o] = pack((p & 255) * 0.55 | 0, ((p >> 8) & 255) * 0.55 | 0, ((p >> 16) & 255) * 0.55 | 0);
+        }
+      }
+      // View rectangle
+      const rx = ox + Math.round(camX / MM), ry = oy + Math.round(camY / MM), rw = VW / MM, rh = VH / MM;
+      for (let x = 0; x < rw; x++) { pixels[ry * VW + rx + x] = 0xffffffff; pixels[(ry + rh - 1) * VW + rx + x] = 0xffffffff; }
+      for (let y = 0; y < rh; y++) { pixels[(ry + y) * VW + rx] = 0xffffffff; pixels[(ry + y) * VW + rx + rw - 1] = 0xffffffff; }
+    }
+
     // ---------- Tools & input ----------
+    const HOLE_TOOL = 255; // not a cell type: clicking places a black hole
     const TOOLS = [
       { name: 'Sand',   el: SAND,  key: '1' },
       { name: 'Dirt',   el: DIRT,  key: '2' },
@@ -694,6 +958,8 @@
       { name: 'Wood',   el: WOOD,  key: '8' },
       { name: 'Stone',  el: STONE, key: '9' },
       { name: 'Wall',   el: WALL,  key: '0' },
+      { name: 'Snow',   el: SNOW,  key: 'S' },
+      { name: 'Black hole', el: HOLE_TOOL, key: 'B' },
       { name: 'Eraser', el: EMPTY, key: 'E' },
     ];
     const SOLIDS = new Set([WALL, WOOD, PLANT]);
@@ -706,7 +972,8 @@
     TOOLS.forEach(tool => {
       const btn = document.createElement('button');
       btn.className = 'tool';
-      const color = tool.el === EMPTY ? 'transparent' : BASE[tool.el][0];
+      const color = tool.el === EMPTY ? 'transparent'
+        : tool.el === HOLE_TOOL ? 'radial-gradient(#000 40%, #f80 60%, #80f)' : BASE[tool.el][0];
       btn.innerHTML = `<span class="swatch" style="background:${color}"></span>${tool.name}<span class="key">${tool.key}</span>`;
       btn.onclick = () => selectTool(tool.el);
       tool.btn = btn;
@@ -719,18 +986,25 @@
     }
     selectTool(SAND);
 
-    const pointer = { x: 0, y: 0, lastX: 0, lastY: 0, down: false, erase: false, inside: false };
+    const pointer = { x: 0, y: 0, lastX: 0, lastY: 0, down: false, inside: false, panning: false };
 
+    // Screen position -> world cell (the camera offset turns view cells into world cells)
     function toGrid(e) {
       const rect = canvas.getBoundingClientRect();
       return [
-        Math.floor((e.clientX - rect.left) / rect.width * W),
-        Math.floor((e.clientY - rect.top) / rect.height * H),
+        camX + Math.floor((e.clientX - rect.left) / rect.width * VW),
+        camY + Math.floor((e.clientY - rect.top) / rect.height * VH),
       ];
     }
 
+    function moveCamera(x, y) {
+      camX = Math.max(0, Math.min(W - VW, Math.round(x)));
+      camY = Math.max(0, Math.min(H - VH, Math.round(y)));
+    }
+
     function paintAt(cx, cy) {
-      const el = pointer.erase ? EMPTY : current;
+      const el = current;
+      if (el === HOLE_TOOL) return;
       const r = brushSize;
       // Solids are drawn fully; loose materials are sprinkled so they pour naturally
       const chance = el === EMPTY || SOLIDS.has(el) ? 1 : 0.35;
@@ -756,22 +1030,38 @@
 
     canvas.addEventListener('pointerdown', e => {
       canvas.setPointerCapture(e.pointerId);
+      // Right (or middle) button drags the view around the world
+      if (e.button === 2 || e.button === 1) {
+        e.preventDefault();
+        pointer.panning = { sx: e.clientX, sy: e.clientY, camX, camY };
+        canvas.style.cursor = 'grabbing';
+        return;
+      }
       [pointer.x, pointer.y] = toGrid(e);
       pointer.lastX = pointer.x;
       pointer.lastY = pointer.y;
+      if (current === HOLE_TOOL) { addHole(pointer.x, pointer.y); return; }
       pointer.down = true;
-      pointer.erase = e.button === 2;
       paintAt(pointer.x, pointer.y);
     });
     canvas.addEventListener('pointermove', e => {
+      if (pointer.panning) {
+        const rect = canvas.getBoundingClientRect(), p = pointer.panning;
+        moveCamera(p.camX - (e.clientX - p.sx) / rect.width * VW, p.camY - (e.clientY - p.sy) / rect.height * VH);
+      }
       [pointer.x, pointer.y] = toGrid(e);
       pointer.inside = true;
       if (pointer.down) paintLine(pointer.lastX, pointer.lastY, pointer.x, pointer.y);
       pointer.lastX = pointer.x;
       pointer.lastY = pointer.y;
     });
-    canvas.addEventListener('pointerup', () => { pointer.down = false; });
-    canvas.addEventListener('pointercancel', () => { pointer.down = false; });
+    function pointerEnd() {
+      pointer.down = false;
+      pointer.panning = false;
+      canvas.style.cursor = '';
+    }
+    canvas.addEventListener('pointerup', pointerEnd);
+    canvas.addEventListener('pointercancel', pointerEnd);
     canvas.addEventListener('pointerleave', () => { pointer.inside = false; });
     canvas.addEventListener('contextmenu', e => e.preventDefault());
 
@@ -791,7 +1081,7 @@
     }
     pauseBtn.onclick = togglePause;
 
-    function clearAll() { type.fill(EMPTY); life.fill(0); }
+    function clearAll() { type.fill(EMPTY); life.fill(0); holes.length = 0; wakeAll(); }
     document.getElementById('clear').onclick = clearAll;
 
     // ---------- Sound (synthesized with Web Audio, no sound files) ----------
@@ -890,8 +1180,35 @@
         }
       },
 
-      // Crickets at night, birds during the day
+      holeBorn() {
+        if (!this.ok('holeBorn', 200)) return;
+        this.tone(140, 30, 1.2, 'sine', 0.3);
+        this.hiss(0.8, 200, 'lowpass', 0.2);
+      },
+
+      // Rain patter, wind with snow, black hole hum, gulps and bursts
+      weatherAndHoles(e) {
+        if (weather === 'rain' && Math.random() < 0.7 && this.ok('rain', 18)) {
+          this.hiss(0.015, 3000 + Math.random() * 4000, 'highpass', 0.02 + Math.random() * 0.03);
+        }
+        if (weather === 'snow' && Math.random() < 0.01 && this.ok('wind', 1200)) {
+          this.hiss(1.4, 300 + Math.random() * 300, 'bandpass', 0.08, 0.5);
+        }
+        if (holes.length && this.ok('hum', 700)) this.tone(55, 48, 0.8, 'sine', 0.08);
+        if (e.eaten && this.ok('gulp', 110)) this.tone(220 + Math.random() * 120, 50, 0.1, 'sine', 0.06);
+        if (e.holeDied && this.ok('burst', 300)) {
+          this.tone(400, 30, 0.7, 'sawtooth', 0.12);
+          this.hiss(0.6, 500, 'lowpass', 0.35);
+        }
+      },
+
+      // Crickets at night, birds during the day (cicadas in a drought)
       ambient() {
+        if (weather === 'drought' && daylight > 0.5 && Math.random() < 0.004 && this.ok('cicada', 2500)) {
+          this.tone(5200, 5000, 0.6, 'square', 0.008);
+          return;
+        }
+        if (weather === 'rain') return; // birds and crickets hide from the rain
         if (daylight < 0.2 && Math.random() < 0.012 && this.ok('cricket', 400)) {
           for (let k = 0; k < 3; k++) this.tone(4300, 4200, 0.03, 'sine', 0.025, k * 0.07);
         } else if (daylight > 0.8 && Math.random() < 0.004 && this.ok('bird', 1500)) {
@@ -903,6 +1220,13 @@
     };
 
     ['pointerdown', 'keydown'].forEach(name => window.addEventListener(name, () => Sound.init()));
+
+    // A clicked button keeps keyboard focus, so Space would "click" it again (e.g. speed up
+    // and pause at the same time). Drop focus after every button click.
+    document.addEventListener('click', e => {
+      const btn = e.target.closest && e.target.closest('button');
+      if (btn) btn.blur();
+    });
 
     // ---------- Speed, sound, background and day/night controls ----------
     const SPEEDS = [0.25, 0.5, 1, 2, 3, 4];
@@ -934,6 +1258,7 @@
       bgKind = kind;
       bgSelect.value = kind;
       bg = buildBackground(kind);
+      skyKey = '';
       updateSky();
       savePrefs();
     }
@@ -946,6 +1271,24 @@
       savePrefs();
     }
     cycleBtn.onclick = () => setCycle(!cycleOn);
+
+    const weatherSelect = document.getElementById('weather');
+    const weatherNow = document.getElementById('weatherNow');
+    const WEATHER_ICONS = { clear: '☀️ clear', rain: '🌧️ raining', snow: '❄️ snowing', drought: '🔥 drought' };
+    function updateWeatherLabel() {
+      weatherNow.textContent = weatherMode === 'auto' ? `now: ${WEATHER_ICONS[weather]}` : '';
+    }
+    function setWeather(mode) {
+      if (![...weatherSelect.options].some(o => o.value === mode)) return;
+      weatherMode = mode;
+      weatherSelect.value = mode;
+      if (mode !== 'auto') weather = mode;
+      else weatherTimer = 600;
+      wakeAll();
+      updateWeatherLabel();
+      savePrefs();
+    }
+    weatherSelect.onchange = () => { setWeather(weatherSelect.value); weatherSelect.blur(); };
 
     const clockEl = document.getElementById('clock');
     function updateClock() {
@@ -960,7 +1303,7 @@
     function savePrefs() {
       if (!prefsLoaded) return;
       try {
-        localStorage.setItem('fallingSandPrefs', JSON.stringify({ bgKind, cycleOn, speedIdx, sound: Sound.enabled }));
+        localStorage.setItem('fallingSandPrefs', JSON.stringify({ bgKind, cycleOn, speedIdx, sound: Sound.enabled, weatherMode }));
       } catch (e) {}
     }
     try {
@@ -969,10 +1312,12 @@
       if (typeof p.cycleOn === 'boolean') setCycle(p.cycleOn);
       if (typeof p.speedIdx === 'number') setSpeed(p.speedIdx);
       if (typeof p.sound === 'boolean') setSound(p.sound);
+      if (typeof p.weatherMode === 'string') setWeather(p.weatherMode);
     } catch (e) {}
     prefsLoaded = true;
     updateSky();
     updateClock();
+    updateWeatherLabel();
 
     window.addEventListener('keydown', e => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
@@ -986,6 +1331,14 @@
       else if (e.key === '=' || e.key === '+') setSpeed(speedIdx + 1);
       else if (e.key === 'n' || e.key === 'N') setCycle(!cycleOn);
       else if (e.key === 'm' || e.key === 'M') setSound(!Sound.enabled);
+      else if (e.key.startsWith('Arrow')) {
+        e.preventDefault();
+        const step = 12;
+        if (e.key === 'ArrowLeft') moveCamera(camX - step, camY);
+        if (e.key === 'ArrowRight') moveCamera(camX + step, camY);
+        if (e.key === 'ArrowUp') moveCamera(camX, camY - step);
+        if (e.key === 'ArrowDown') moveCamera(camX, camY + step);
+      }
     });
 
     // ---------- Main loop ----------
@@ -995,22 +1348,26 @@
     function loop(now) {
       if (pointer.down) {
         paintAt(pointer.x, pointer.y); // keep pouring while held
-        Sound.paint(pointer.erase ? EMPTY : current);
+        Sound.paint(current);
       }
       if (!paused) {
         stepAcc += SPEEDS[speedIdx];
+        const start = performance.now();
         while (stepAcc >= 1) {
           stepAcc--;
           step();
           if (cycleOn) timeOfDay = (timeOfDay + 1 / DAY_STEPS) % 1;
+          // If this computer can't keep up, drop the extra steps instead of freezing
+          if (performance.now() - start > 12) { stepAcc = 0; break; }
         }
         if (Sound.running()) {
           Sound.react(ev);
+          Sound.weatherAndHoles(ev);
           if (cycleOn && bg.celestial) Sound.ambient();
         }
       }
       for (const k in ev) ev[k] = 0;
-      if (frame % 2 === 0) updateSky();
+      updateSky();
       render();
 
       fpsFrames++;
