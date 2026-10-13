@@ -170,7 +170,7 @@
       acid eats almost everything except walls ·
       sand sinks through water.<br>
       Trees grow faster in daylight · snow melts near fire and in warm weather ·
-      drought dries up water and withers plants · a black hole swallows everything, grows, then bursts.<br>
+      drought dries up water and withers plants · a black hole sucks in most of the map, grows, then bursts.<br>
       <strong>Mouse:</strong> left-click draw · right-click drag to move the view (or arrow keys).<br>
       <strong>Keys:</strong> 1–9, 0 pick a material · S snow · B black hole · E eraser · Space pause · C clear ·
       [ ] brush size · − + speed · N day/night · M sound
@@ -512,10 +512,14 @@
     }
 
     // ---------- Black holes ----------
-    // Holes are not cells: they float over the grid, pull loose particles in a spiral,
-    // eat everything that reaches their core (even walls), grow, and finally burst.
+    // Holes are not cells: they float over the grid and pull in almost the whole map in a
+    // spiral, eat everything that reaches their core (even walls), grow, and finally burst.
     const holes = [];
-    const MAX_HOLES = 5, HOLE_LIFE = 900;
+    const MAX_HOLES = 3, HOLE_LIFE = 1200;
+
+    // How easily each material gets dragged along (walls and trees hold on harder)
+    const PULL = new Float32Array(NUM_TYPES).fill(1);
+    PULL[WALL] = 0.08; PULL[WOOD] = 0.3; PULL[TREE] = 0.3; PULL[PLANT] = 0.5; PULL[LEAF] = 0.6;
 
     function addHole(x, y) {
       if (holes.length >= MAX_HOLES) holes.shift();
@@ -524,9 +528,77 @@
     }
 
     function holeRadius(h) {
-      const grown = Math.min(12, 2.5 + Math.sqrt(h.mass) / 4);
+      const grown = Math.min(16, 2.5 + Math.sqrt(h.mass) / 5);
       const left = HOLE_LIFE - h.age;
       return left < 90 ? Math.max(0.8, grown * left / 90) : grown; // shrinks before dying
+    }
+
+    // Move one particle a step toward the hole: straight in from far away, swirling near
+    // the core. The step direction is picked with some randomness that averages out to the
+    // true direction, so particles flow in smooth streams instead of rigid diagonal lines.
+    // Returns the particle's new cell index, or -1 if it couldn't move.
+    function pullStep(h, x, y, i, t, d) {
+      const vx = h.x - x, vy = h.y - y;
+      const swirl = 0.7 * Math.min(1, 25 / d);
+      const mx = vx - vy * swirl, my = vy + vx * swirl;
+      const ax = Math.abs(mx), ay = Math.abs(my), m = Math.max(ax, ay);
+      let sx = rand() < ax / m ? Math.sign(mx) : 0;
+      let sy = rand() < ay / m ? Math.sign(my) : 0;
+      if (tryMove(i, x + sx, y + sy, t)) return (y + sy) * W + x + sx;
+      // Blocked: try the straight-in direction along the stronger axis
+      if (ax > ay) { sx = Math.sign(mx); sy = 0; } else { sx = 0; sy = Math.sign(my); }
+      if (tryMove(i, x + sx, y + sy, t)) return (y + sy) * W + x + sx;
+      return -1;
+    }
+
+    function tryMove(i, tx, ty, t) {
+      if (!inb(tx, ty)) return false;
+      const j = ty * W + tx, tt = type[j];
+      if (j !== i && (tt === EMPTY || DENS[tt] < DENS[t])) { swap(i, j); return true; }
+      return false;
+    }
+
+    // Gravity reaches most of the map and gets stronger as the hole grows.
+    // Cells are visited from the core outward, so inner particles move out of the way first
+    // and whole streams flow in together. Anything in range ignores normal physics this step,
+    // otherwise ordinary gravity would keep pulling it back down.
+    function pullToward(h) {
+      const R = Math.min(500, 200 + Math.sqrt(h.mass) * 4), R2 = R * R;
+      const G = 30 + Math.sqrt(h.mass) * 1.5;
+      const maxY = Math.min(Math.max(h.y, H - 1 - h.y), Math.ceil(R));
+      const maxX = Math.min(Math.max(h.x, W - 1 - h.x), Math.ceil(R));
+      for (let ay = 0; ay <= maxY; ay++) {
+        for (let sy = -1; sy <= 1; sy += 2) {
+          if (ay === 0 && sy === 1) continue;
+          const y = h.y + ay * sy;
+          if (y < 0 || y >= H) continue;
+          const row = y * W;
+          for (let ax = 0; ax <= maxX; ax++) {
+            const d2 = ax * ax + ay * ay;
+            if (d2 > R2) break;
+            for (let sx = -1; sx <= 1; sx += 2) {
+              if (ax === 0 && sx === 1) continue;
+              const x = h.x + ax * sx;
+              if (x < 0 || x >= W) continue;
+              const i = row + x, t = type[i];
+              if (t === EMPTY || done[i] === frame) continue;
+              done[i] = frame; // held by the hole: skip normal physics this step
+              const d = Math.sqrt(d2);
+              const p = Math.min(1, G / d + 0.12) * PULL[t];
+              if (rand() >= p) continue;
+              // Particles speed up as they fall in: up to 3 cells per step near the hole
+              let moves = d < 60 ? 3 : d < 130 ? 2 : 1;
+              for (let at = i, px = x, py = y, pd = d; moves-- > 0;) {
+                at = pullStep(h, px, py, at, t, pd);
+                if (at < 0) break;
+                px = at % W; py = (at - px) / W;
+                pd = Math.hypot(h.x - px, h.y - py);
+                if (pd < 1) break;
+              }
+            }
+          }
+        }
+      }
     }
 
     function updateHoles() {
@@ -553,21 +625,7 @@
             if (type[i] !== EMPTY) { set(i, EMPTY); h.mass++; ev.eaten++; }
           }
         }
-        // Pull loose particles inward, with a sideways swirl
-        const samples = R * R * 1.2 | 0;
-        for (let k = 0; k < samples; k++) {
-          const a = rand() * Math.PI * 2, d = Math.sqrt(rand()) * R;
-          const px = Math.round(h.x + Math.cos(a) * d), py = Math.round(h.y + Math.sin(a) * d);
-          if (!inb(px, py)) continue;
-          const i = py * W + px, t = type[i];
-          if (t === EMPTY || DENS[t] === 255 || rand() < d / R) continue; // solids stay put; pull is stronger near the core
-          const vx = h.x - px, vy = h.y - py;
-          const sx = Math.sign(vx - vy * 0.8), sy = Math.sign(vy + vx * 0.8);
-          const tx = px + sx, ty = py + sy;
-          if (!inb(tx, ty)) continue;
-          const j = ty * W + tx;
-          if (type[j] === EMPTY || DENS[type[j]] < DENS[t]) swap(i, j);
-        }
+        pullToward(h);
       }
       // Two holes that touch merge into one
       for (let a = 0; a < holes.length; a++) {
